@@ -4,14 +4,14 @@ const mongoose = require('mongoose');
 const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
-const nodemailer = require('nodemailer');
+const { Resend } = require('resend');
 
 const app = express();
 const port = process.env.PORT || 3000;
 const jwtSecret = process.env.JWT_SECRET;
 
-if (!process.env.MONGO_URI || !process.env.SMTP_USER || !process.env.SMTP_PASS || !jwtSecret) {
-    throw new Error("MONGO_URI, SMTP_USER, SMTP_PASS, and JWT_SECRET must be configured");
+if (!process.env.MONGO_URI || !process.env.RESEND_API_KEY || !process.env.FROM_EMAIL || !jwtSecret) {
+    throw new Error("MONGO_URI, RESEND_API_KEY, FROM_EMAIL, and JWT_SECRET must be configured");
 }
 
 app.use(cors({ origin: process.env.FRONTEND_ORIGIN || "http://localhost:5173" }));
@@ -91,32 +91,9 @@ app.get("/history", requireAuth, async (req, res) => {
     }
 });
 
-// Create transporter — forced to IPv4 with explicit host/port.
-// Fixes the "works on localhost, times out on Render" issue, which happens
-// because Render resolves smtp.gmail.com over IPv6 by default and Gmail's
-// SMTP servers often don't respond properly over IPv6 from datacenter IPs.
-const transporter = nodemailer.createTransport({
-    host: 'smtp.gmail.com',
-    port: 465,
-    secure: true,          // true for port 465, false for port 587
-    family: 4,              // force IPv4
-    connectionTimeout: 15000,
-    greetingTimeout: 15000,
-    socketTimeout: 15000,
-    auth: {
-        user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASS,
-    },
-});
-
-// Verify SMTP connection at boot so the real error shows up in Render logs
-transporter.verify((err, success) => {
-    if (err) {
-        console.error("SMTP connection failed:", err.message);
-    } else {
-        console.log("SMTP server is ready to send messages");
-    }
-});
+// Resend client — sends over HTTPS (port 443), which avoids the SMTP port
+// blocking that causes "Connection timeout" on Render and similar hosts.
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 app.post("/sendmail", requireAuth, async (req, res) => {
     const msg = req.body.msg;
@@ -148,11 +125,11 @@ app.post("/sendmail", requireAuth, async (req, res) => {
             body: msg.trim(),
         });
 
-        // Send all emails at the same time
+        // Send all emails at the same time via Resend's HTTP API
         const results = await Promise.allSettled(
             emailList.map((recipient) =>
-                transporter.sendMail({
-                    from: process.env.SMTP_USER,
+                resend.emails.send({
+                    from: process.env.FROM_EMAIL,
                     to: recipient,
                     subject: subject.trim(),
                     text: msg.trim(),
@@ -160,14 +137,20 @@ app.post("/sendmail", requireAuth, async (req, res) => {
             )
         );
 
-        // Check if any email failed
+        // Resend resolves successfully even on API-level errors, so check
+        // both promise rejection and an `error` field in the resolved value
         const failed = results.filter(
-            (result) => result.status === "rejected"
+            (result) => result.status === "rejected" || result.value?.error
         );
 
         if (failed.length > 0) {
-            // Log the actual per-recipient error so Render logs show why
-            failed.forEach((f) => console.error("sendMail failed:", f.reason?.message || f.reason));
+            failed.forEach((f) => {
+                if (f.status === "rejected") {
+                    console.error("sendMail failed:", f.reason?.message || f.reason);
+                } else {
+                    console.error("sendMail failed:", f.value.error);
+                }
+            });
 
             await history.findByIdAndUpdate(record._id, {
                 status: "failed"
