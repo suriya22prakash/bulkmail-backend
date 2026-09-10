@@ -3,8 +3,6 @@ const cors = require('cors');
 const mongoose = require('mongoose');
 const jwt = require('jsonwebtoken');
 require('dotenv').config();
-const dns = require("dns");
-dns.setServers(["8.8.8.8"]);
 
 const nodemailer = require('nodemailer');
 
@@ -93,16 +91,32 @@ app.get("/history", requireAuth, async (req, res) => {
     }
 });
 
-
-// Create transporter
+// Create transporter — forced to IPv4 with explicit host/port.
+// Fixes the "works on localhost, times out on Render" issue, which happens
+// because Render resolves smtp.gmail.com over IPv6 by default and Gmail's
+// SMTP servers often don't respond properly over IPv6 from datacenter IPs.
 const transporter = nodemailer.createTransport({
-    service: 'gmail',
+    host: 'smtp.gmail.com',
+    port: 465,
+    secure: true,          // true for port 465, false for port 587
+    family: 4,              // force IPv4
+    connectionTimeout: 15000,
+    greetingTimeout: 15000,
+    socketTimeout: 15000,
     auth: {
         user: process.env.SMTP_USER,
         pass: process.env.SMTP_PASS,
     },
 });
 
+// Verify SMTP connection at boot so the real error shows up in Render logs
+transporter.verify((err, success) => {
+    if (err) {
+        console.error("SMTP connection failed:", err.message);
+    } else {
+        console.log("SMTP server is ready to send messages");
+    }
+});
 
 app.post("/sendmail", requireAuth, async (req, res) => {
     const msg = req.body.msg;
@@ -134,7 +148,6 @@ app.post("/sendmail", requireAuth, async (req, res) => {
             body: msg.trim(),
         });
 
-
         // Send all emails at the same time
         const results = await Promise.allSettled(
             emailList.map((recipient) =>
@@ -147,14 +160,15 @@ app.post("/sendmail", requireAuth, async (req, res) => {
             )
         );
 
-
         // Check if any email failed
         const failed = results.filter(
             (result) => result.status === "rejected"
         );
 
-
         if (failed.length > 0) {
+            // Log the actual per-recipient error so Render logs show why
+            failed.forEach((f) => console.error("sendMail failed:", f.reason?.message || f.reason));
+
             await history.findByIdAndUpdate(record._id, {
                 status: "failed"
             });
@@ -164,7 +178,6 @@ app.post("/sendmail", requireAuth, async (req, res) => {
                 message: `${failed.length} email(s) failed to send`
             });
         }
-
 
         await history.findByIdAndUpdate(record._id, {
             status: "sent"
@@ -187,7 +200,6 @@ app.post("/sendmail", requireAuth, async (req, res) => {
         });
     }
 });
-
 
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
