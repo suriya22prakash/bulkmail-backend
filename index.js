@@ -93,13 +93,23 @@ app.get("/history", requireAuth, async (req, res) => {
     }
 });
 
-// Create a transporter
+
+// Create transporter
+const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASS,
+    },
+});
+
 
 app.post("/sendmail", requireAuth, async (req, res) => {
     const msg = req.body.msg;
     const email = req.body.email;
     const recipients = req.body.recipients;
     const subject = req.body.subject;
+
     const emailList = [...(Array.isArray(email) ? email : [email]), ...(Array.isArray(recipients) ? recipients : [recipients])]
         .flatMap((recipient) => typeof recipient === "string" ? recipient.split(",") : [])
         .map((recipient) => recipient.trim())
@@ -107,8 +117,12 @@ app.post("/sendmail", requireAuth, async (req, res) => {
         .filter((recipient, index, list) => list.indexOf(recipient) === index);
 
     const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
     if (!subject?.trim() || !msg?.trim() || emailList.length === 0 || emailList.some((emailAddress) => !emailPattern.test(emailAddress))) {
-        return res.status(400).send({ success: false, message: "Enter a subject, body, and valid recipient emails" });
+        return res.status(400).send({
+            success: false,
+            message: "Enter a subject, body, and valid recipient emails"
+        });
     }
 
     let record;
@@ -120,34 +134,59 @@ app.post("/sendmail", requireAuth, async (req, res) => {
             body: msg.trim(),
         });
 
-        const transporter = nodemailer.createTransport({
-            service: 'gmail',
-            auth: {
-                user: process.env.SMTP_USER,
-                pass: process.env.SMTP_PASS,
-            },
-        });
-        for (const recipient of emailList) {
-            await transporter.sendMail({
-                from: process.env.SMTP_USER,
-                to: recipient,
-                subject: subject.trim(),
-                text: msg.trim(),
+
+        // Send all emails at the same time
+        const results = await Promise.allSettled(
+            emailList.map((recipient) =>
+                transporter.sendMail({
+                    from: process.env.SMTP_USER,
+                    to: recipient,
+                    subject: subject.trim(),
+                    text: msg.trim(),
+                })
+            )
+        );
+
+
+        // Check if any email failed
+        const failed = results.filter(
+            (result) => result.status === "rejected"
+        );
+
+
+        if (failed.length > 0) {
+            await history.findByIdAndUpdate(record._id, {
+                status: "failed"
+            });
+
+            return res.status(502).send({
+                success: false,
+                message: `${failed.length} email(s) failed to send`
             });
         }
 
-        await history.findByIdAndUpdate(record._id, { status: "sent" });
+
+        await history.findByIdAndUpdate(record._id, {
+            status: "sent"
+        });
+
         res.send({ success: true });
+
     } catch (err) {
         console.log(err);
+
         if (record) {
-            await history.findByIdAndUpdate(record._id, { status: "failed" });
+            await history.findByIdAndUpdate(record._id, {
+                status: "failed"
+            });
         }
-        res.status(502).send({ success: false, message: "Email delivery failed" });
+
+        res.status(502).send({
+            success: false,
+            message: "Email delivery failed"
+        });
     }
-
-
-})
+});
 
 
 app.listen(port, () => {
