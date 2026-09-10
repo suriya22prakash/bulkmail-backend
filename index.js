@@ -3,15 +3,17 @@ const cors = require('cors');
 const mongoose = require('mongoose');
 const jwt = require('jsonwebtoken');
 require('dotenv').config();
+const dns = require("dns");
+dns.setServers(["8.8.8.8"]);
 
-const { Resend } = require('resend');
+const nodemailer = require('nodemailer');
 
 const app = express();
 const port = process.env.PORT || 3000;
 const jwtSecret = process.env.JWT_SECRET;
 
-if (!process.env.MONGO_URI || !process.env.RESEND_API_KEY || !process.env.FROM_EMAIL || !jwtSecret) {
-    throw new Error("MONGO_URI, RESEND_API_KEY, FROM_EMAIL, and JWT_SECRET must be configured");
+if (!process.env.MONGO_URI || !process.env.SMTP_USER || !process.env.SMTP_PASS || !jwtSecret) {
+    throw new Error("MONGO_URI, SMTP_USER, SMTP_PASS, and JWT_SECRET must be configured");
 }
 
 app.use(cors({ origin: process.env.FRONTEND_ORIGIN || "http://localhost:5173" }));
@@ -91,16 +93,13 @@ app.get("/history", requireAuth, async (req, res) => {
     }
 });
 
-// Resend client — sends over HTTPS (port 443), which avoids the SMTP port
-// blocking that causes "Connection timeout" on Render and similar hosts.
-const resend = new Resend(process.env.RESEND_API_KEY);
+// Create a transporter
 
 app.post("/sendmail", requireAuth, async (req, res) => {
     const msg = req.body.msg;
     const email = req.body.email;
     const recipients = req.body.recipients;
     const subject = req.body.subject;
-
     const emailList = [...(Array.isArray(email) ? email : [email]), ...(Array.isArray(recipients) ? recipients : [recipients])]
         .flatMap((recipient) => typeof recipient === "string" ? recipient.split(",") : [])
         .map((recipient) => recipient.trim())
@@ -108,12 +107,8 @@ app.post("/sendmail", requireAuth, async (req, res) => {
         .filter((recipient, index, list) => list.indexOf(recipient) === index);
 
     const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
     if (!subject?.trim() || !msg?.trim() || emailList.length === 0 || emailList.some((emailAddress) => !emailPattern.test(emailAddress))) {
-        return res.status(400).send({
-            success: false,
-            message: "Enter a subject, body, and valid recipient emails"
-        });
+        return res.status(400).send({ success: false, message: "Enter a subject, body, and valid recipient emails" });
     }
 
     let record;
@@ -125,64 +120,35 @@ app.post("/sendmail", requireAuth, async (req, res) => {
             body: msg.trim(),
         });
 
-        // Send all emails at the same time via Resend's HTTP API
-        const results = await Promise.allSettled(
-            emailList.map((recipient) =>
-                resend.emails.send({
-                    from: process.env.FROM_EMAIL,
-                    to: recipient,
-                    subject: subject.trim(),
-                    text: msg.trim(),
-                })
-            )
-        );
-
-        // Resend resolves successfully even on API-level errors, so check
-        // both promise rejection and an `error` field in the resolved value
-        const failed = results.filter(
-            (result) => result.status === "rejected" || result.value?.error
-        );
-
-        if (failed.length > 0) {
-            failed.forEach((f) => {
-                if (f.status === "rejected") {
-                    console.error("sendMail failed:", f.reason?.message || f.reason);
-                } else {
-                    console.error("sendMail failed:", f.value.error);
-                }
-            });
-
-            await history.findByIdAndUpdate(record._id, {
-                status: "failed"
-            });
-
-            return res.status(502).send({
-                success: false,
-                message: `${failed.length} email(s) failed to send`
+        const transporter = nodemailer.createTransport({
+            service: 'gmail',
+            auth: {
+                user: process.env.SMTP_USER,
+                pass: process.env.SMTP_PASS,
+            },
+        });
+        for (const recipient of emailList) {
+            await transporter.sendMail({
+                from: process.env.SMTP_USER,
+                to: recipient,
+                subject: subject.trim(),
+                text: msg.trim(),
             });
         }
 
-        await history.findByIdAndUpdate(record._id, {
-            status: "sent"
-        });
-
+        await history.findByIdAndUpdate(record._id, { status: "sent" });
         res.send({ success: true });
-
     } catch (err) {
         console.log(err);
-
         if (record) {
-            await history.findByIdAndUpdate(record._id, {
-                status: "failed"
-            });
+            await history.findByIdAndUpdate(record._id, { status: "failed" });
         }
-
-        res.status(502).send({
-            success: false,
-            message: "Email delivery failed"
-        });
+        res.status(502).send({ success: false, message: "Email delivery failed" });
     }
-});
+
+
+})
+
 
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
